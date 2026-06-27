@@ -355,24 +355,38 @@ mkdir -p "$NAME"
 cp /tmp/tilt-attach "$NAME/tilt-attach" && chmod +x "$NAME/tilt-attach"
 # (optional) add a README.txt with install/usage notes
 tar -czf "${NAME}.tar.gz" "$NAME"
-sha256sum "${NAME}.tar.gz" | tee "${NAME}.tar.gz.sha256"   # filename-relative
+# NOTE: publish the checksum as `.sha256.txt`, NOT a bare `.sha256`. The GitHub
+# release uploads host (uploads.github.com) returns 403 for a `.sha256`
+# extension asset; `.sha256.txt` uploads fine. The tarball itself uploads OK.
+sha256sum "${NAME}.tar.gz" | tee "${NAME}.tar.gz.sha256.txt"   # filename-relative
 rm -rf "$NAME"
 ```
 
-The `.sha256` is filename-relative so consumers can `sha256sum -c` from their
-download dir.
+The `.sha256.txt` is filename-relative so consumers can `sha256sum -c` from
+their download dir.
 
 ### Publish
 
-Create/upload to a release on the fork, tagging with the upstream version +
-fork SHA, e.g. tag `0.37.5-<sha>`:
+Create the release first, then upload assets separately (the combined
+create+upload occasionally 403s mid-upload; splitting is more robust). Tag with
+the upstream version + fork SHA, e.g. `0.37.5-<sha>`:
 
 ```bash
 gh release create "0.37.5-${SHA}" \
   --repo valstro/tilt \
+  --target feat/attach \
   --title "tilt-attach 0.37.4 (${SHA})" \
-  --notes "attach-fork tilt: image reuse + port-forward pod-pick fix. See FORK_ATTACH_DESIGN.md." \
-  "${NAME}.tar.gz" "${NAME}.tar.gz.sha256"
+  --notes "attach-fork tilt: image reuse + port-forward pod-pick fix + reused-ImageMap-status persistence. See FORK_ATTACH_DESIGN.md."
+
+gh release upload "0.37.5-${SHA}" --repo valstro/tilt "${NAME}.tar.gz"
+gh release upload "0.37.5-${SHA}" --repo valstro/tilt "${NAME}.tar.gz.sha256.txt"
 ```
 
-Then update the `TAG`/`ASSET` in omskit `tools/tilt/README.md` to match.
+Retire the previous release/tag so there is a single current download:
+
+```bash
+gh release delete "0.37.5-<oldSHA>" --repo valstro/tilt --cleanup-tag --yes
+```
+
+Then update the `TAG`/`ASSET` (and the `.sha256.txt` pattern) in omskit
+`tools/tilt/README.md` to match.
