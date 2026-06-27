@@ -20,6 +20,15 @@ type BuildHandler func(
 
 type ReuseRefChecker func(ctx context.Context, iTarget model.ImageTarget, namedTagged reference.NamedTagged) (bool, error)
 
+// ClusterRefResolver resolves the image ref currently running in the cluster for
+// an image target, used by attach mode to reuse a running image instead of
+// building one. Returns (nil, nil) when no running ref can be resolved (the
+// target then falls through to a normal build).
+//
+// This is injected (rather than called directly) so the queue stays pure and
+// unit-testable without a live cluster.
+type ClusterRefResolver func(ctx context.Context, iTarget model.ImageTarget) (reference.NamedTagged, error)
+
 // A little data structure to help iterate through dirty targets in dependency order.
 type TargetQueue struct {
 	sortedTargets []model.TargetSpec
@@ -42,9 +51,27 @@ type TargetQueue struct {
 	// A target that depends on a dirty target should never use its previous
 	// result to build the next result.
 	depsNeedBuild map[model.TargetID]bool
+
+	// Attach mode: image refs reused from the running cluster (no prior build
+	// result, but the image is already running). Backfilled as synthetic
+	// results so the target counts as already-built.
+	clusterReuse map[model.TargetID]reference.NamedTagged
 }
 
 func NewImageTargetQueue(ctx context.Context, iTargets []model.ImageTarget, state store.BuildStateSet, canReuseRef ReuseRefChecker) (*TargetQueue, error) {
+	return newImageTargetQueue(ctx, iTargets, state, canReuseRef, nil)
+}
+
+// NewImageTargetQueueWithClusterReuse is like NewImageTargetQueue but, when
+// resolveClusterRef is non-nil (attach mode), an image target that has never
+// been built this session may reuse the image already running in the cluster
+// instead of forcing a build. The DockerImage/ImageMap/LiveUpdate wiring is
+// left intact, so a later file change still triggers a normal build.
+func NewImageTargetQueueWithClusterReuse(ctx context.Context, iTargets []model.ImageTarget, state store.BuildStateSet, canReuseRef ReuseRefChecker, resolveClusterRef ClusterRefResolver) (*TargetQueue, error) {
+	return newImageTargetQueue(ctx, iTargets, state, canReuseRef, resolveClusterRef)
+}
+
+func newImageTargetQueue(ctx context.Context, iTargets []model.ImageTarget, state store.BuildStateSet, canReuseRef ReuseRefChecker, resolveClusterRef ClusterRefResolver) (*TargetQueue, error) {
 	targets := make([]model.TargetSpec, 0, len(iTargets))
 	for _, iTarget := range iTargets {
 		if iTarget.IsLiveUpdateOnly {
@@ -58,11 +85,40 @@ func NewImageTargetQueue(ctx context.Context, iTargets []model.ImageTarget, stat
 		return nil, err
 	}
 
+	// Attach mode: image refs reused from the running cluster, keyed by target.
+	// These get backfilled as synthetic build results so the target is treated
+	// as already-built (no build stage) while staying fully wired.
+	clusterReuse := make(map[model.TargetID]reference.NamedTagged)
+
 	needsOwnBuild := make(map[model.TargetID]bool)
 	for _, target := range sortedTargets {
 		id := target.ID()
 		if state[id].NeedsImageBuild() {
-			needsOwnBuild[id] = true
+			// Attach mode: a fresh target (never built this session) with no
+			// file/dep changes can reuse the image already running in the
+			// cluster instead of building. Only applies to the "no prior
+			// result" case; an explicit rebuild trigger or file change
+			// (FullBuildTriggered / FilesChangedSet) still forces a build.
+			reused := false
+			if resolveClusterRef != nil &&
+				state[id].IsEmpty() &&
+				len(state[id].FilesChangedSet) == 0 &&
+				len(state[id].DepsChangedSet) == 0 &&
+				!state[id].FullBuildTriggered {
+				ref, err := resolveClusterRef(ctx, target.(model.ImageTarget))
+				if err != nil {
+					return nil, errors.Wrapf(err, "resolving running cluster image for %s", id.Name)
+				}
+				if ref != nil {
+					logger.Get(ctx).Infof("Attaching to running image %s for %s (skipping build)",
+						container.FamiliarString(ref), id.Name)
+					clusterReuse[id] = ref
+					reused = true
+				}
+			}
+			if !reused {
+				needsOwnBuild[id] = true
+			}
 		} else if state[id].LastResult != nil {
 			image := store.LocalImageRefFromBuildResult(state[id].LastResult)
 			imageRef, err := container.ParseNamedTagged(image)
@@ -97,6 +153,7 @@ func NewImageTargetQueue(ctx context.Context, iTargets []model.ImageTarget, stat
 		results:       results,
 		needsOwnBuild: needsOwnBuild,
 		depsNeedBuild: depsNeedBuild,
+		clusterReuse:  clusterReuse,
 	}
 	err = queue.backfillExistingResults()
 	if err != nil {
@@ -159,6 +216,13 @@ func (q *TargetQueue) backfillExistingResults() error {
 	for _, target := range q.sortedTargets {
 		id := target.ID()
 		if !q.isBuilding(id) {
+			// Attach mode: synthesize a build result from the image already
+			// running in the cluster (there is no prior LastResult to reuse).
+			if ref, ok := q.clusterReuse[id]; ok {
+				q.results[id] = store.NewImageBuildResultSingleRef(id, ref)
+				continue
+			}
+
 			// We can re-use results from the previous build.
 			lastResult := q.state[id].LastResult
 			imageResult, ok := lastResult.(store.ImageBuildResult)

@@ -177,6 +177,86 @@ func TestTargetQueue_DepsBuiltButReaped(t *testing.T) {
 	assert.Equal(t, expectedCalls, f.handler.calls)
 }
 
+func TestTargetQueue_ClusterReuse_SkipsBuild(t *testing.T) {
+	f := newTargetQueueFixture(t)
+
+	fooTarget := newDockerImageTarget("foo")
+	// Fresh state: never built this session. Without attach this forces a build.
+	s1 := store.BuildState{}
+
+	targets := []model.ImageTarget{fooTarget}
+	buildStateSet := store.BuildStateSet{fooTarget.ID(): s1}
+
+	// Attach: a running image is resolvable for this target.
+	runningRef := container.MustParseNamedTagged("foo:tilt-running")
+	f.resolveClusterRef = func(ctx context.Context, it model.ImageTarget) (reference.NamedTagged, error) {
+		return runningRef, nil
+	}
+
+	f.run(targets, buildStateSet)
+
+	// No build should have happened: the running image is reused.
+	assert.Equal(t, map[model.TargetID]fakeBuildHandlerCall{}, f.handler.calls)
+
+	// And the queue exposes the running image as a reused result.
+	reused := f.tq.ReusedResults()
+	if assert.Contains(t, reused, fooTarget.ID()) {
+		assert.Equal(t, "foo:tilt-running", store.ClusterImageRefFromBuildResult(reused[fooTarget.ID()]))
+	}
+}
+
+func TestTargetQueue_ClusterReuse_FileChangedStillBuilds(t *testing.T) {
+	f := newTargetQueueFixture(t)
+
+	fooTarget := newDockerImageTarget("foo")
+	// A prior result + a file change: attach must NOT short-circuit; this is a
+	// real edit and should rebuild normally.
+	s1 := store.BuildState{
+		LastResult: store.NewImageBuildResultSingleRef(
+			fooTarget.ID(),
+			container.MustParseNamedTagged("foo:1234"),
+		),
+		FilesChangedSet: map[string]bool{"hello.txt": true},
+	}
+
+	targets := []model.ImageTarget{fooTarget}
+	buildStateSet := store.BuildStateSet{fooTarget.ID(): s1}
+
+	resolverCalled := false
+	f.resolveClusterRef = func(ctx context.Context, it model.ImageTarget) (reference.NamedTagged, error) {
+		resolverCalled = true
+		return container.MustParseNamedTagged("foo:tilt-running"), nil
+	}
+
+	f.run(targets, buildStateSet)
+
+	// The edited target builds.
+	fooCall := newFakeBuildHandlerCall(fooTarget, 1, []store.ImageBuildResult{})
+	assert.Equal(t, map[model.TargetID]fakeBuildHandlerCall{fooTarget.ID(): fooCall}, f.handler.calls)
+	// Reuse only applies to fresh (empty) state, so the resolver isn't consulted.
+	assert.False(t, resolverCalled, "cluster reuse must not be attempted when files changed")
+}
+
+func TestTargetQueue_ClusterReuse_NoRunningImageBuilds(t *testing.T) {
+	f := newTargetQueueFixture(t)
+
+	fooTarget := newDockerImageTarget("foo")
+	s1 := store.BuildState{}
+
+	targets := []model.ImageTarget{fooTarget}
+	buildStateSet := store.BuildStateSet{fooTarget.ID(): s1}
+
+	// Attach enabled, but no running image resolvable -> falls back to a build.
+	f.resolveClusterRef = func(ctx context.Context, it model.ImageTarget) (reference.NamedTagged, error) {
+		return nil, nil
+	}
+
+	f.run(targets, buildStateSet)
+
+	fooCall := newFakeBuildHandlerCall(fooTarget, 1, []store.ImageBuildResult{})
+	assert.Equal(t, map[model.TargetID]fakeBuildHandlerCall{fooTarget.ID(): fooCall}, f.handler.calls)
+}
+
 func newFakeBuildHandlerCall(target model.ImageTarget, num int, depResults []store.ImageBuildResult) fakeBuildHandlerCall {
 	return fakeBuildHandlerCall{
 		target: target,
@@ -215,10 +295,12 @@ func (fbh *fakeBuildHandler) handle(target model.TargetSpec, depResults []store.
 }
 
 type targetQueueFixture struct {
-	t             *testing.T
-	ctx           context.Context
-	handler       *fakeBuildHandler
-	missingImages []reference.NamedTagged
+	t                 *testing.T
+	ctx               context.Context
+	handler           *fakeBuildHandler
+	missingImages     []reference.NamedTagged
+	resolveClusterRef ClusterRefResolver
+	tq                *TargetQueue
 }
 
 func newTargetQueueFixture(t *testing.T) *targetQueueFixture {
@@ -244,10 +326,11 @@ func (f *targetQueueFixture) setMissingImage(namedTagged reference.NamedTagged) 
 }
 
 func (f *targetQueueFixture) run(targets []model.ImageTarget, buildStateSet store.BuildStateSet) {
-	tq, err := NewImageTargetQueue(f.ctx, targets, buildStateSet, f.imageExists)
+	tq, err := NewImageTargetQueueWithClusterReuse(f.ctx, targets, buildStateSet, f.imageExists, f.resolveClusterRef)
 	if err != nil {
 		f.t.Fatal(err)
 	}
+	f.tq = tq
 
 	err = tq.RunBuilds(f.handler.handle)
 	if err != nil {

@@ -67,7 +67,11 @@ func (ibd *ImageBuildAndDeployer) BuildAndDeploy(ctx context.Context, st store.R
 		})
 	}()
 
-	q, err := NewImageTargetQueue(ctx, iTargets, stateSet, ibd.ib.CanReuseRef)
+	state := st.RLockState()
+	tiltfileArgs := append([]string{}, state.UserConfigState.Args...)
+	st.RUnlockState()
+
+	q, err := NewImageTargetQueueWithClusterReuse(ctx, iTargets, stateSet, ibd.ib.CanReuseRef, ibd.clusterRefResolverFor(kTarget, tiltfileArgs))
 	if err != nil {
 		return store.BuildResultSet{}, err
 	}
@@ -144,6 +148,27 @@ func (ibd *ImageBuildAndDeployer) BuildAndDeploy(ctx context.Context, st store.R
 	newResults := q.NewResults().ToBuildResultSet()
 	if err != nil {
 		return newResults, WrapDontFallBackError(err)
+	}
+
+	// Attach mode: image targets reused from the running cluster are not
+	// rebuilt, so their ImageMap objects still have an empty status. Merge the
+	// queue's synthetic results into imageMapSet so the deploy injects the
+	// running image ref (TILT_IMAGE_i) instead of an empty/untagged value.
+	for _, iTarget := range iTargets {
+		if iTarget.IsLiveUpdateOnly {
+			continue
+		}
+		nn := types.NamespacedName{Name: iTarget.ImageMapName()}
+		im := imageMapSet[nn]
+		if im == nil {
+			continue
+		}
+		if im.Status.ImageFromCluster != "" {
+			continue
+		}
+		if res, ok := q.AllResults()[iTarget.ID()]; ok {
+			im.Status = res.ImageMapStatus
+		}
 	}
 
 	// (If we pass an empty list of refs here (as we will do if only deploying
