@@ -1231,6 +1231,57 @@ func (f *ibdFixture) refs(iTarget model.ImageTarget) container.RefSet {
 	return refs
 }
 
+// TestAttachReuse_PersistsImageMapStatus is a regression test for a bug where,
+// in attach mode (image reused from the running cluster, no build), the
+// synthetic build result was merged only into the in-memory ImageMap copy used
+// for deploy and never written back to the API server. The live update
+// reconciler matches running pod containers via
+// ImageMap.Status.ImageFromCluster (KubernetesSelectorMatchesContainer); with
+// the status left empty, no container matched, the LiveUpdate tracked zero
+// containers, and live_update silently never fired until a full rebuild wrote
+// the status. The IBD must persist the reused status to the API.
+func TestAttachReuse_PersistsImageMapStatus(t *testing.T) {
+	f := newIBDFixture(t, clusterid.ProductGKE)
+
+	m := NewSanchoDockerBuildManifest(f)
+	iTarget := m.ImageTargets[0]
+
+	// The image already running in the cluster (what attach reuses).
+	runningRef, err := container.ParseNamedTagged(
+		"gcr.io/some-project-162817/sancho:tilt-deadbeefdeadbeef")
+	require.NoError(t, err)
+
+	// Inject a fake cluster-ref resolver so the attach reuse path fires without
+	// a live cluster / kubectl, regardless of env or Tiltfile args.
+	f.ibd.clusterRefResolverForTest = func(_ model.K8sTarget, _ []string) ClusterRefResolver {
+		return func(_ context.Context, it model.ImageTarget) (reference.NamedTagged, error) {
+			if it.ID() == iTarget.ID() {
+				return runningRef, nil
+			}
+			return nil, nil
+		}
+	}
+
+	// Fresh, empty state => NeedsImageBuild() true => eligible for reuse.
+	_, err = f.BuildAndDeploy(BuildTargets(m), store.BuildStateSet{})
+	require.NoError(t, err)
+
+	// No build should have happened.
+	assert.Equal(t, 0, f.docker.BuildCount,
+		"attach reuse should not trigger a docker build")
+
+	// The API ImageMap status must now carry the reused running ref, so the
+	// live update reconciler can match the running container.
+	var im v1alpha1.ImageMap
+	require.NoError(t, f.ctrlClient.Get(f.ctx,
+		ktypes.NamespacedName{Name: iTarget.ImageMapName()}, &im))
+	assert.Equal(t, container.FamiliarString(runningRef), im.Status.ImageFromCluster,
+		"reused ImageMap.Status.ImageFromCluster must be persisted to the API")
+	assert.True(t,
+		container.ImageNamesEqual(im.Status.ImageFromCluster, runningRef.String()),
+		"persisted status must match the running container image for live update")
+}
+
 func newK8sMultiEntityManifest(name string) model.Manifest {
 	yaml := fmt.Sprintf(`
 apiVersion: v1

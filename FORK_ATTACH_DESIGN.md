@@ -168,6 +168,50 @@ Verified: `go test ./internal/engine/buildcontrol/ ./internal/store/` green;
 `go vet` clean; `go build ./cmd/tilt` produces a working binary
 (`v0.37.4-dev`).
 
+### Bug fix: live_update never fired after attach (reused ImageMap status not persisted)
+
+Symptom: after `tilt up -- --attach`, an attached resource (e.g. `orders`)
+showed `updateStatus: pending` with `runtimeStatus: ok`, no new logs, and
+live_update never ran — until a manual full rebuild+redeploy, after which
+live_update worked. Inspecting the API: `ImageMap orders` had `image: None`
+(empty status) and the `LiveUpdate orders:orders` had `status.containers: null`.
+
+Root cause: the live update reconciler matches running pod containers via
+`ImageMap.Status.ImageFromCluster`
+(`internal/controllers/apis/liveupdate/liveupdate.go` →
+`KubernetesSelectorMatchesContainer`, since OMSKit live updates use an
+`ImageMapName` selector). In a normal build, the dockerimage/cmdimage
+reconciler's `ForceApply` writes that status to the API server
+(`setImageMapStatus` → `client.Status().Update`). In attach reuse mode that
+reconciler never runs, so the ImageMap status stayed empty. The fork's merge of
+the synthetic result (in `image_build_and_deployer.go`) only updated the
+**in-memory `DeepCopy`** used to inject `TILT_IMAGE_i` into the deploy — it was
+never written back to the API. With `ImageFromCluster == ""`,
+`ImageNamesEqual("", "<running ref>")` is false → zero matched containers →
+`LiveUpdate.status.containers: null` → live_update has no target. A full
+rebuild "fixed" it only because it ran the real reconciler that persists the
+status.
+
+Fix (`internal/engine/buildcontrol/image_build_and_deployer.go`): in the
+attach-reuse merge block, after `im.Status = res.ImageMapStatus`, also
+`ctrlClient.Status().Update(ctx, im)` so the persisted ImageMap carries the
+reused running ref and the live update reconciler can match the container.
+(`NewImageBuildResultSingleRef` already populates `ImageFromCluster` correctly.)
+
+Also added a test seam + regression test:
+- `ImageBuildAndDeployer.clusterRefResolverForTest` (overrides
+  `clusterRefResolverFor`) so the attach path is unit-testable without a live
+  cluster/kubectl; production leaves it nil.
+- `image_build_and_deployer_test.go::TestAttachReuse_PersistsImageMapStatus`:
+  injects a fake running ref, runs `BuildAndDeploy` on empty state, asserts no
+  docker build happened AND the **API** ImageMap's `ImageFromCluster` was
+  persisted and matches the running container image. The pre-existing
+  queue-level reuse tests never caught this because they don't exercise the
+  IBD's API writes.
+
+Verified live on local-ac: attach no longer rolls pods, ImageMap populated, and
+editing a watched source file triggers live_update with no rebuild/redeploy.
+
 ### Using with OMSKit
 
 The engine half (skip build) pairs with the deploy half already in OMSKit
@@ -193,6 +237,82 @@ Point OMSKit at the forked binary against a running local-ac and confirm:
 - startup: no `accounts` image build, pod keeps its running tilt-<hash> tag;
 - edit `apps/entrypoints/accounts/dist/app/...` → live_update sync;
 - click rebuild → full build + deploy.
+
+## Decision: upstream `initial_sync()` (PR #6737) does NOT replace this fork
+
+Upstream merged `initial_sync()` (tilt-dev/tilt#6737, merged 2026-04-24 as
+`0729c7d`; docs follow-up #6758), which addresses issue #2582 ("enable syncing
+to a prebuilt image with no docker push"). We evaluated whether it removes the
+need for this fork. **It does not.** Keep the fork.
+
+### What `initial_sync()` does
+
+A new `live_update` step (must be first in the step list). On a fresh `tilt up`,
+when a container is already running and has never been synced
+(`monitor.needsInitialSync()` — no tracked container yet, or
+`lastFileTimeSynced.IsZero()`), the live_update reconciler enters `maybeSync`
+**with no file-change events** and pushes a **full tar of all `sync()` paths**
+into the running container (`reconciler.go` `isInitialSync` branch →
+`build.SyncsToPathMappings` → `build.TarArchiveForPaths`). It reuses the same
+ignore set as `sync()` (`buildInitialSyncFilter` over the `FileWatch` ignores).
+
+It is purely a **file-sync-into-an-already-running-container** primitive. It does
+**nothing** about image builds, the deploy/apply step, or Helm.
+
+### Why it is NOT an attach mechanism
+
+`initial_sync()` assumes Tilt has **already deployed** the workload. It does not
+touch the two gates this fork exists to bypass:
+
+1. **The image build gate** (`target_queue.go:64`, `BuildState.NeedsImageBuild()`
+   at `internal/store/build_result.go:260`). `initial_sync` does not bypass it.
+   The upstream use case sidesteps builds only because it uses a stock pullable
+   image (e.g. `nginx:alpine`) via `k8s_custom_deploy` with **no Tilt-managed
+   build target** — so there was never a build to gate.
+2. **The Helm upgrade / apply** (our `helm_resource` → `helm upgrade`, which
+   rolls pods). `initial_sync` never prevents Tilt from re-applying manifests.
+
+The two solve **different halves**:
+
+| Concern                              | This fork (`--attach`)                       | `initial_sync()` (#6737)            |
+|--------------------------------------|----------------------------------------------|-------------------------------------|
+| Skip image build on startup          | yes (synthetic `ImageBuildResult` reuse)     | no (only if you have no build target) |
+| Skip Helm upgrade / no pod roll      | yes (`TILT_HELM_ATTACH` helm-helper patch)   | no (not addressed)                  |
+| Attach to live pods & logs           | yes                                          | n/a (assumes already deployed)      |
+| Working live_update after attach     | yes                                          | yes (the part it does well)         |
+| Seed container w/ local source on start | no (relies on the running image being right) | yes (its whole point)            |
+
+Replacing the fork with stock Tilt + `initial_sync` would require rewriting
+OMSKit to have **no image-build target and no Helm apply** for attached services
+(e.g. `k8s_custom_deploy` with a no-op apply) — far more invasive, and
+`k8s_custom_deploy` still runs its `apply_cmd`. The supported deploy paths
+(`docker_build`/`k8s_yaml`/`helm`) all still gate the first apply on a built
+ImageMap (the wall this fork was built for; cf. issue #6649).
+
+### Where it IS useful to us (adopt additively)
+
+`initial_sync()` is the upstream-blessed fix for one real limitation of the
+current attach: today we **assume the running cluster image already contains the
+right code**, and live_update only pushes edits made *after* attaching. If the
+local tree has drifted from what's baked in the attached pod, attach does not
+reconcile that drift on connect.
+
+Decision:
+- **Keep the fork.** `initial_sync()` removes neither the build-skip nor the
+  helm-upgrade-skip; it is not an attach mechanism.
+- **Adopt `initial_sync()` additively** after rebasing the fork onto a `master`
+  that includes `0729c7d`: add `initial_sync()` as the first live_update step for
+  attached services so attach reconciles local↔pod drift on connect. Strictly an
+  improvement to the existing attach UX, not a replacement.
+- **Strategic upside:** pulling `0729c7d` into the fork is low-cost, reduces
+  long-term divergence, and strengthens the eventual upstream-PR story — our
+  `TILT_ATTACH_REUSE_CLUSTER_IMAGES` build-skip is the natural complement to the
+  now-merged `initial_sync` sync-skip.
+
+Open follow-ups (not yet done): (1) confirm whether the fork's v0.37.4 base
+already contains `0729c7d`, scope a rebase if not; (2) prototype `initial_sync()`
+in the OMSKit live_update step lists under `--attach` and validate drift
+reconcile on local-ac.
 
 ## Building & releasing the binary
 

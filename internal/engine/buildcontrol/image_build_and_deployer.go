@@ -29,6 +29,20 @@ type ImageBuildAndDeployer struct {
 	clock      build.Clock
 	ctrlClient ctrlclient.Client
 	r          *kubernetesapply.Reconciler
+
+	// clusterRefResolverForTest, when non-nil, overrides clusterRefResolverFor.
+	// Used by tests to exercise the attach reuse path without a live cluster /
+	// kubectl. Production leaves it nil.
+	clusterRefResolverForTest func(kTarget model.K8sTarget, tiltfileArgs []string) ClusterRefResolver
+}
+
+// resolveClusterRefFor returns the attach cluster-ref resolver, honoring a test
+// override when set.
+func (ibd *ImageBuildAndDeployer) resolveClusterRefFor(kTarget model.K8sTarget, tiltfileArgs []string) ClusterRefResolver {
+	if ibd.clusterRefResolverForTest != nil {
+		return ibd.clusterRefResolverForTest(kTarget, tiltfileArgs)
+	}
+	return ibd.clusterRefResolverFor(kTarget, tiltfileArgs)
 }
 
 func NewImageBuildAndDeployer(
@@ -71,7 +85,7 @@ func (ibd *ImageBuildAndDeployer) BuildAndDeploy(ctx context.Context, st store.R
 	tiltfileArgs := append([]string{}, state.UserConfigState.Args...)
 	st.RUnlockState()
 
-	q, err := NewImageTargetQueueWithClusterReuse(ctx, iTargets, stateSet, ibd.ib.CanReuseRef, ibd.clusterRefResolverFor(kTarget, tiltfileArgs))
+	q, err := NewImageTargetQueueWithClusterReuse(ctx, iTargets, stateSet, ibd.ib.CanReuseRef, ibd.resolveClusterRefFor(kTarget, tiltfileArgs))
 	if err != nil {
 		return store.BuildResultSet{}, err
 	}
@@ -151,9 +165,19 @@ func (ibd *ImageBuildAndDeployer) BuildAndDeploy(ctx context.Context, st store.R
 	}
 
 	// Attach mode: image targets reused from the running cluster are not
-	// rebuilt, so their ImageMap objects still have an empty status. Merge the
-	// queue's synthetic results into imageMapSet so the deploy injects the
-	// running image ref (TILT_IMAGE_i) instead of an empty/untagged value.
+	// rebuilt, so the normal build path (dockerimage/cmdimage reconciler) that
+	// writes ImageMap.Status never runs. We must do two things here:
+	//
+	//  1. Merge the queue's synthetic result into the in-memory imageMapSet so
+	//     the deploy injects the running image ref (TILT_IMAGE_i) instead of an
+	//     empty/untagged value.
+	//  2. PERSIST that status to the API server. The live update reconciler
+	//     matches running pod containers by comparing
+	//     ImageMap.Status.ImageFromCluster against the container image
+	//     (KubernetesSelectorMatchesContainer). If the ImageMap status stays
+	//     empty, no container matches, the LiveUpdate has zero tracked
+	//     containers, and live_update silently never fires until a full rebuild
+	//     writes the status. So we Status().Update it here.
 	for _, iTarget := range iTargets {
 		if iTarget.IsLiveUpdateOnly {
 			continue
@@ -166,8 +190,17 @@ func (ibd *ImageBuildAndDeployer) BuildAndDeploy(ctx context.Context, st store.R
 		if im.Status.ImageFromCluster != "" {
 			continue
 		}
-		if res, ok := q.AllResults()[iTarget.ID()]; ok {
-			im.Status = res.ImageMapStatus
+		res, ok := q.AllResults()[iTarget.ID()]
+		if !ok || res.ImageMapStatus.ImageFromCluster == "" {
+			continue
+		}
+		im.Status = res.ImageMapStatus
+
+		// Persist so the live update reconciler can match running containers.
+		if err := ibd.ctrlClient.Status().Update(ctx, im); err != nil {
+			return newResults, WrapDontFallBackError(
+				fmt.Errorf("attach: updating reused ImageMap status for %s: %w",
+					iTarget.ImageMapName(), err))
 		}
 	}
 
