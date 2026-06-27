@@ -193,3 +193,66 @@ Point OMSKit at the forked binary against a running local-ac and confirm:
 - startup: no `accounts` image build, pod keeps its running tilt-<hash> tag;
 - edit `apps/entrypoints/accounts/dist/app/...` → live_update sync;
 - click rebuild → full build + deploy.
+
+## Building & releasing the binary
+
+The fork is distributed as a prebuilt binary on GitHub Releases
+(https://github.com/valstro/tilt/releases). Consumers install it as
+`tilt-attach` (see omskit `tools/tilt/README.md`).
+
+### Build a release binary (linux/amd64)
+
+From the fork checkout, at the commit you want to release:
+
+```bash
+cd /path/to/tilt-fork
+git checkout <ref>                 # the fork commit/tag to release
+SHA=$(git rev-parse --short HEAD)
+
+# stripped (-s -w) to shrink the binary; embeds the fork SHA in the version.
+go build -mod vendor \
+  -ldflags "-s -w -X 'github.com/tilt-dev/tilt/internal/cli.commitSHA=${SHA}-attachfork'" \
+  -o /tmp/tilt-attach ./cmd/tilt
+
+/tmp/tilt-attach version   # -> v0.37.4-dev
+```
+
+Notes:
+- `devVersion` (`internal/cli/build.go`) is the upstream base (currently
+  `0.37.4`); `-dev` is appended automatically for non-tagged builds.
+- `-s -w` strips debug symbols (≈170MB → ≈121MB on disk). Drop them if you want
+  a debuggable binary.
+- This produces a **linux/amd64** binary (build host arch). For other platforms
+  set `GOOS`/`GOARCH`, e.g. `GOOS=darwin GOARCH=arm64 go build ...`.
+
+### Package the release asset
+
+```bash
+SHA=$(git rev-parse --short HEAD)
+NAME="tilt-attach-v0.37.4-${SHA}-linux-amd64"
+
+mkdir -p "$NAME"
+cp /tmp/tilt-attach "$NAME/tilt-attach" && chmod +x "$NAME/tilt-attach"
+# (optional) add a README.txt with install/usage notes
+tar -czf "${NAME}.tar.gz" "$NAME"
+sha256sum "${NAME}.tar.gz" | tee "${NAME}.tar.gz.sha256"   # filename-relative
+rm -rf "$NAME"
+```
+
+The `.sha256` is filename-relative so consumers can `sha256sum -c` from their
+download dir.
+
+### Publish
+
+Create/upload to a release on the fork, tagging with the upstream version +
+fork SHA, e.g. tag `0.37.5-<sha>`:
+
+```bash
+gh release create "0.37.5-${SHA}" \
+  --repo valstro/tilt \
+  --title "tilt-attach 0.37.4 (${SHA})" \
+  --notes "attach-fork tilt: image reuse + port-forward pod-pick fix. See FORK_ATTACH_DESIGN.md." \
+  "${NAME}.tar.gz" "${NAME}.tar.gz.sha256"
+```
+
+Then update the `TAG`/`ASSET` in omskit `tools/tilt/README.md` to match.
