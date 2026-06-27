@@ -148,6 +148,19 @@ func populateContainerPorts(pft *v1alpha1.PortForwardTemplateSpec, pod *v1alpha1
 // So pick the "best" pod to portforward to.
 // May be nil if there is no eligible pod.
 func PickBestPortForwardPod(kd *v1alpha1.KubernetesDiscovery) *v1alpha1.Pod {
+	// Container ports requested by the forward template (explicit, non-zero).
+	// A pod that exposes these is strongly preferred so we don't attach the
+	// port-forward to a sibling pod (e.g. a Debezium/outbox pod under the same
+	// resource) that doesn't listen on the app's ports. See isBetterPortForwardPod.
+	var wantPorts []int32
+	if kd.Spec.PortForwardTemplateSpec != nil {
+		for _, f := range kd.Spec.PortForwardTemplateSpec.Forwards {
+			if f.ContainerPort != 0 {
+				wantPorts = append(wantPorts, f.ContainerPort)
+			}
+		}
+	}
+
 	var bestPod *v1alpha1.Pod
 	for _, pod := range kd.Status.Pods {
 		if pod.Name == "" {
@@ -162,15 +175,42 @@ func PickBestPortForwardPod(kd *v1alpha1.KubernetesDiscovery) *v1alpha1.Pod {
 		}
 
 		// This pod is eligible! Now compare it to the existing candidate (if there is one).
-		if bestPod == nil || isBetterPortForwardPod(&pod, bestPod) {
+		if bestPod == nil || isBetterPortForwardPod(&pod, bestPod, wantPorts) {
 			bestPod = &pod
 		}
 	}
 	return bestPod
 }
 
+// podCoversPorts reports whether the pod exposes every requested container port.
+func podCoversPorts(pod *v1alpha1.Pod, wantPorts []int32) bool {
+	if len(wantPorts) == 0 {
+		return false
+	}
+	have := make(map[int32]bool)
+	for _, p := range store.AllPodContainerPorts(*pod) {
+		have[p] = true
+	}
+	for _, want := range wantPorts {
+		if !have[want] {
+			return false
+		}
+	}
+	return true
+}
+
 // Check if podA is better than podB for port-forwarding.
-func isBetterPortForwardPod(podA, podB *v1alpha1.Pod) bool {
+func isBetterPortForwardPod(podA, podB *v1alpha1.Pod, wantPorts []int32) bool {
+	// Prefer a pod that actually exposes the requested container ports. This
+	// disambiguates resources that own multiple workloads (e.g. an app + a
+	// sidecar/outbox Deployment) so the forward attaches to the pod that
+	// actually listens on those ports.
+	aCovers := podCoversPorts(podA, wantPorts)
+	bCovers := podCoversPorts(podB, wantPorts)
+	if aCovers != bCovers {
+		return aCovers
+	}
+
 	// A non-deleting pod is always better than a deleting pod.
 	if podB.Deleting && !podA.Deleting {
 		return true

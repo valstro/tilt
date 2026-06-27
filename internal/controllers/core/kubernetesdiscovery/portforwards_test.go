@@ -2,6 +2,7 @@ package kubernetesdiscovery
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -226,4 +227,50 @@ func TestPortForwardNotForPending(t *testing.T) {
 	f.MustReconcile(key)
 
 	assert.True(t, f.Get(types.NamespacedName{Name: "kd-pod"}, &pf))
+}
+
+// When a resource owns multiple workloads (e.g. an app + an outbox/sidecar
+// Deployment), prefer the pod that actually exposes the requested container
+// ports, even if it is older than a sibling pod that does not. Regression test
+// for the port-forward attaching to the wrong pod (orders app vs orders-outbox).
+func TestPickBestPortForwardPodPrefersPortCoverage(t *testing.T) {
+	now := metav1.Now()
+	older := metav1.NewTime(now.Add(-time.Hour))
+
+	appPod := v1alpha1.Pod{
+		Name:      "orders-app",
+		Phase:     string(v1.PodRunning),
+		CreatedAt: older, // older
+		Containers: []v1alpha1.Container{
+			{Name: "orders", Ports: []int32{80, 9239}},
+		},
+	}
+	// Sibling outbox pod: newer (would win on recency) but lacks 80/9239.
+	outboxPod := v1alpha1.Pod{
+		Name:      "orders-outbox",
+		Phase:     string(v1.PodRunning),
+		CreatedAt: now, // newer
+		Containers: []v1alpha1.Container{
+			{Name: "kafka-connect", Ports: []int32{8083, 9464}},
+		},
+	}
+
+	kd := &v1alpha1.KubernetesDiscovery{
+		Spec: v1alpha1.KubernetesDiscoverySpec{
+			PortForwardTemplateSpec: &v1alpha1.PortForwardTemplateSpec{
+				Forwards: []v1alpha1.Forward{
+					{LocalPort: 8091, ContainerPort: 80},
+					{LocalPort: 9300, ContainerPort: 9239},
+				},
+			},
+		},
+		Status: v1alpha1.KubernetesDiscoveryStatus{
+			Pods: []v1alpha1.Pod{outboxPod, appPod},
+		},
+	}
+
+	best := PickBestPortForwardPod(kd)
+	require.NotNil(t, best)
+	assert.Equal(t, "orders-app", best.Name,
+		"port-forward should target the pod exposing the requested ports, not the newer sibling")
 }
