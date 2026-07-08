@@ -49,6 +49,7 @@ Add an "attach / reuse-from-cluster" path so that, when enabled, an image whose
 **cluster-running tag is resolvable** is treated as already-built:
 
 1. **Config plumbing**: a new boolean that reaches `BuildAndDeploy`. Options:
+
    - simplest: an env var read in `NewImageTargetQueue` /
      `image_build_and_deployer.go` (e.g. `TILT_ATTACH_REUSE_CLUSTER_IMAGES`),
      gated so default behavior is unchanged.
@@ -65,13 +66,14 @@ Add an "attach / reuse-from-cluster" path so that, when enabled, an image whose
 3. **Short-circuit the queue**: in `NewImageTargetQueue`, when the flag is set
    and a running tag is resolvable AND `state[id].IsEmpty()` (fresh, no prior
    build) AND no files changed:
+
    - do NOT set `needsOwnBuild[id]`,
    - **backfill a synthetic `ImageBuildResult`** carrying the running ref into
      `q.results[id]` (mirror `backfillExistingResults`, but the result is
      synthesized from the cluster tag rather than a `LastResult`).
-   This makes `isBuilding(id)` false → no build stage; `ReusedResults()` lists it
-   under "Loading cached images"; the ImageMap is populated from the synthetic
-   result; and `deploy()` (line 151) runs with the correct image injected.
+     This makes `isBuilding(id)` false → no build stage; `ReusedResults()` lists it
+     under "Loading cached images"; the ImageMap is populated from the synthetic
+     result; and `deploy()` (line 151) runs with the correct image injected.
 
 4. **Keep wiring intact**: because the ImageTarget/DockerImage/ImageMap/
    LiveUpdate objects are untouched, a later file edit sets
@@ -86,6 +88,7 @@ Add an "attach / reuse-from-cluster" path so that, when enabled, an image whose
    true attach: no build, no upgrade, no rollout — yet rebuild/live_update wired.
 
 ### Key files to change
+
 - `internal/engine/buildcontrol/target_queue.go` — short-circuit + synthetic
   backfill (core change).
 - `internal/build/image_builder.go` — optional: a `CanReuseClusterRef` that
@@ -95,9 +98,10 @@ Add an "attach / reuse-from-cluster" path so that, when enabled, an image whose
 - (cluster-image resolution) reuse `internal/k8s` client already wired into the
   IBD, or pass the tag via spec/env to avoid a cluster read in the hot path.
 - If going the spec route: `pkg/apis/core/v1alpha1/{kubernetesapply,imagemap}_types.go`
-  + `make update-codegen` + Starlark binding in `internal/tiltfile`.
+  - `make update-codegen` + Starlark binding in `internal/tiltfile`.
 
 ### Build & test the fork
+
 - Build: `make build` (or `go build ./cmd/tilt`); produces a `tilt` binary.
 - Targeted tests: `go test ./internal/engine/buildcontrol/...` (there is
   `target_queue`/`build_control_test.go` coverage to extend), plus
@@ -107,6 +111,7 @@ Add an "attach / reuse-from-cluster" path so that, when enabled, an image whose
   → live_update, click rebuild → full build+deploy.
 
 ### Risk / maintenance
+
 - Localized change (1 core file + plumbing); no architectural change — the
   controller-runtime model isolates it.
 - Cost is maintaining a forked binary across releases and distributing it to the
@@ -117,6 +122,7 @@ Add an "attach / reuse-from-cluster" path so that, when enabled, an image whose
 
 Yes — this is a well-scoped Go change in a self-contained package, ideal for an
 autonomous coding agent IF it has:
+
 1. The clone (`/home/ac/dev/tilt-root`) and a Go toolchain matching `go.mod`.
 2. Ability to run `make build` / `go test ./internal/engine/buildcontrol/...`.
 3. A way to validate against a live cluster (the hard part — needs the running
@@ -125,6 +131,7 @@ autonomous coding agent IF it has:
    fixture).
 
 Recommended split:
+
 - **Agent-suitable**: implement the queue short-circuit + synthetic backfill +
   unit tests (steps 1-4 above) entirely against the repo's test suite. This is
   deterministic and verifiable without a cluster.
@@ -148,6 +155,7 @@ Implemented against v0.37.4. Env-gated by `TILT_ATTACH_REUSE_CLUSTER_IMAGES`
 (truthy = on); default behavior is unchanged.
 
 Files:
+
 - `internal/engine/buildcontrol/target_queue.go` — added
   `ClusterRefResolver`, `NewImageTargetQueueWithClusterReuse`, a `clusterReuse`
   map, the short-circuit in the build-decision loop (fresh/empty state + no
@@ -199,6 +207,7 @@ reused running ref and the live update reconciler can match the container.
 (`NewImageBuildResultSingleRef` already populates `ImageFromCluster` correctly.)
 
 Also added a test seam + regression test:
+
 - `ImageBuildAndDeployer.clusterRefResolverForTest` (overrides
   `clusterRefResolverFor`) so the attach path is unit-testable without a live
   cluster/kubectl; production leaves it nil.
@@ -233,7 +242,9 @@ Result: `tilt up -- --attach` attaches with no image build and no helm upgrade,
 yet rebuild + live_update work on demand.
 
 ### Manual cluster validation (still TODO — needs live env)
+
 Point OMSKit at the forked binary against a running local-ac and confirm:
+
 - startup: no `accounts` image build, pod keeps its running tilt-<hash> tag;
 - edit `apps/entrypoints/accounts/dist/app/...` → live_update sync;
 - click rebuild → full build + deploy.
@@ -274,13 +285,13 @@ touch the two gates this fork exists to bypass:
 
 The two solve **different halves**:
 
-| Concern                              | This fork (`--attach`)                       | `initial_sync()` (#6737)            |
-|--------------------------------------|----------------------------------------------|-------------------------------------|
-| Skip image build on startup          | yes (synthetic `ImageBuildResult` reuse)     | no (only if you have no build target) |
-| Skip Helm upgrade / no pod roll      | yes (`TILT_HELM_ATTACH` helm-helper patch)   | no (not addressed)                  |
-| Attach to live pods & logs           | yes                                          | n/a (assumes already deployed)      |
-| Working live_update after attach     | yes                                          | yes (the part it does well)         |
-| Seed container w/ local source on start | no (relies on the running image being right) | yes (its whole point)            |
+| Concern                                 | This fork (`--attach`)                       | `initial_sync()` (#6737)              |
+| --------------------------------------- | -------------------------------------------- | ------------------------------------- |
+| Skip image build on startup             | yes (synthetic `ImageBuildResult` reuse)     | no (only if you have no build target) |
+| Skip Helm upgrade / no pod roll         | yes (`TILT_HELM_ATTACH` helm-helper patch)   | no (not addressed)                    |
+| Attach to live pods & logs              | yes                                          | n/a (assumes already deployed)        |
+| Working live_update after attach        | yes                                          | yes (the part it does well)           |
+| Seed container w/ local source on start | no (relies on the running image being right) | yes (its whole point)                 |
 
 Replacing the fork with stock Tilt + `initial_sync` would require rewriting
 OMSKit to have **no image-build target and no Helm apply** for attached services
@@ -293,11 +304,12 @@ ImageMap (the wall this fork was built for; cf. issue #6649).
 
 `initial_sync()` is the upstream-blessed fix for one real limitation of the
 current attach: today we **assume the running cluster image already contains the
-right code**, and live_update only pushes edits made *after* attaching. If the
+right code**, and live*update only pushes edits made \_after* attaching. If the
 local tree has drifted from what's baked in the attached pod, attach does not
 reconcile that drift on connect.
 
 Decision:
+
 - **Keep the fork.** `initial_sync()` removes neither the build-skip nor the
   helm-upgrade-skip; it is not an attach mechanism.
 - **Adopt `initial_sync()` additively** after rebasing the fork onto a `master`
@@ -329,27 +341,53 @@ cd /path/to/tilt-fork
 git checkout <ref>                 # the fork commit/tag to release
 SHA=$(git rev-parse --short HEAD)
 
-# stripped (-s -w) to shrink the binary; embeds the fork SHA in the version.
+# 1) Build + embed the web UI. Without this, pkg/assets/build/ has no
+#    index.html, GetEmbeddedServer() returns (_, false), and a dev build falls
+#    back to LOCAL web mode — which runs `yarn` at startup (fails under a
+#    mise-managed Node toolchain: "No version is set for shim: yarn").
+make build-js                      # yarn build → cp web/build/* pkg/assets/build/
+
+# 2) Compile. Set main.version WITHOUT a "-dev" suffix so TiltBuild.Dev=false
+#    and the binary defaults to prod → EmbeddedWebMode (serves the assets from
+#    step 1, never touches yarn). Stripped (-s -w) to shrink the binary.
 go build -mod vendor \
-  -ldflags "-s -w -X 'github.com/tilt-dev/tilt/internal/cli.commitSHA=${SHA}-attachfork'" \
+  -ldflags "-s -w \
+    -X 'main.version=0.37.4-attachfork-${SHA}' \
+    -X 'main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)' \
+    -X 'github.com/tilt-dev/tilt/internal/cli.commitSHA=${SHA}-attachfork'" \
   -o /tmp/tilt-attach ./cmd/tilt
 
-/tmp/tilt-attach version   # -> v0.37.4-dev
+/tmp/tilt-attach version   # -> v0.37.4-attachfork-<sha>  (NOT "-dev")
 ```
 
+Web-mode background (why the two steps above matter):
+
+- `internal/cli/up.go:provideWebMode` → a `Dev` build defaults to `LocalWebMode`
+  (webpack dev server = `yarn`); a non-dev build defaults to `ProdWebMode`.
+- `provideAssetServer`/`targetMode` only serve `EmbeddedWebMode` when embedded
+  assets are present (`pkg/assets/embedded.go` `//go:embed build`,
+  `GetEmbeddedServer` checks for `build/index.html`).
+- `cmd/tilt/main.go` sets `Dev` implicitly: an empty `main.version` makes
+  `TiltBuild.Empty()` true → `defaultTiltInfo()` with `Dev:true`. Setting
+  `main.version` (no `-dev`) keeps `Dev:false`.
+- So a release binary needs BOTH: embedded assets (`make build-js`) AND a
+  non-empty `main.version`. Stock upstream releases do this via goreleaser.
+
 Notes:
+
 - `devVersion` (`internal/cli/build.go`) is the upstream base (currently
-  `0.37.4`); `-dev` is appended automatically for non-tagged builds.
-- `-s -w` strips debug symbols (≈170MB → ≈121MB on disk). Drop them if you want
-  a debuggable binary.
+  `0.37.4`); it's only used as a fallback when `main.version` is empty.
+- `-s -w` strips debug symbols. With embedded web assets the binary is ≈125MB
+  (vs ≈121MB without assets); packaged tar.gz ≈40MB.
 - This produces a **linux/amd64** binary (build host arch). For other platforms
-  set `GOOS`/`GOARCH`, e.g. `GOOS=darwin GOARCH=arm64 go build ...`.
+  set `GOOS`/`GOARCH`, e.g. `GOOS=darwin GOARCH=arm64 go build ...`. (`make
+build-js` is host-arch-independent; only the Go compile is cross-built.)
 
 ### Package the release asset
 
 ```bash
 SHA=$(git rev-parse --short HEAD)
-NAME="tilt-attach-v0.37.4-${SHA}-linux-amd64"
+NAME="tilt-attach-v0.37.4-${SHA}-web-linux-amd64"   # "-web" = embedded assets
 
 mkdir -p "$NAME"
 cp /tmp/tilt-attach "$NAME/tilt-attach" && chmod +x "$NAME/tilt-attach"
@@ -369,17 +407,19 @@ their download dir.
 
 Create the release first, then upload assets separately (the combined
 create+upload occasionally 403s mid-upload; splitting is more robust). Tag with
-the upstream version + fork SHA, e.g. `0.37.5-<sha>`:
+the upstream version + fork SHA + `-web` (embedded assets), e.g.
+`0.37.5-<sha>-web`:
 
 ```bash
-gh release create "0.37.5-${SHA}" \
+TAG="0.37.5-${SHA}-web"
+gh release create "$TAG" \
   --repo valstro/tilt \
   --target feat/attach \
-  --title "tilt-attach 0.37.4 (${SHA})" \
-  --notes "attach-fork tilt: image reuse + port-forward pod-pick fix + reused-ImageMap-status persistence. See FORK_ATTACH_DESIGN.md."
+  --title "tilt-attach 0.37.4 (${SHA}, embedded web)" \
+  --notes "attach-fork tilt with embedded web assets (prod web mode, no yarn at startup): image reuse + port-forward pod-pick fix + reused-ImageMap-status persistence. See FORK_ATTACH_DESIGN.md."
 
-gh release upload "0.37.5-${SHA}" --repo valstro/tilt "${NAME}.tar.gz"
-gh release upload "0.37.5-${SHA}" --repo valstro/tilt "${NAME}.tar.gz.sha256.txt"
+gh release upload "$TAG" --repo valstro/tilt "${NAME}.tar.gz"
+gh release upload "$TAG" --repo valstro/tilt "${NAME}.tar.gz.sha256.txt"
 ```
 
 Retire the previous release/tag so there is a single current download:
