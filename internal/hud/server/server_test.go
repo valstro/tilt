@@ -7,11 +7,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -20,6 +22,7 @@ import (
 
 	tiltanalytics "github.com/tilt-dev/tilt/internal/analytics"
 	"github.com/tilt-dev/tilt/internal/controllers/fake"
+	hudclient "github.com/tilt-dev/tilt/internal/hud/client"
 	"github.com/tilt-dev/tilt/internal/hud/server"
 	"github.com/tilt-dev/tilt/internal/hud/view"
 	"github.com/tilt-dev/tilt/internal/sliceutils"
@@ -28,6 +31,7 @@ import (
 	"github.com/tilt-dev/tilt/internal/token"
 	"github.com/tilt-dev/tilt/pkg/apis/core/v1alpha1"
 	"github.com/tilt-dev/tilt/pkg/assets"
+	"github.com/tilt-dev/tilt/pkg/logger"
 	"github.com/tilt-dev/tilt/pkg/model"
 	"github.com/tilt-dev/wmclient/pkg/analytics"
 )
@@ -537,4 +541,60 @@ func TestRequireTokenBypassedWhenDisabled(t *testing.T) {
 	// No token sent; auth is disabled via env var, so request should pass.
 	status, _ := f.routerReq(http.MethodGet, "/api/view", nil)
 	require.Equal(t, http.StatusOK, status)
+}
+
+func (f *serverFixture) httpServer() *httptest.Server {
+	srv := httptest.NewServer(f.serv.Router())
+	f.t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestViewWebsocketRefusedWithoutCSRF(t *testing.T) {
+	f := newTestFixture(t)
+	f.setToken(testToken)
+	srv := f.httpServer()
+	wsBase := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws/view"
+
+	for name, rawURL := range map[string]string{
+		"no csrf":    wsBase,
+		"wrong csrf": wsBase + "?csrf=not-the-token",
+	} {
+		t.Run(name, func(t *testing.T) {
+			// A non-browser client sends no Origin header; that must not be
+			// enough to open the socket.
+			conn, resp, err := websocket.DefaultDialer.Dial(rawURL, nil)
+			if conn != nil {
+				_ = conn.Close()
+			}
+			require.ErrorIs(t, err, websocket.ErrBadHandshake)
+			require.NotNil(t, resp)
+			require.Equal(t, http.StatusForbidden, resp.StatusCode)
+		})
+	}
+}
+
+func TestLogStreamerConnectsWithSessionToken(t *testing.T) {
+	f := newTestFixture(t)
+	f.setToken(testToken)
+	srv := f.httpServer()
+
+	u, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+	out := &bytes.Buffer{}
+	filter := hudclient.NewLogFilter(hudclient.FilterSourceAll, hudclient.FilterResources{},
+		hudclient.FilterLevel(logger.InfoLvl), hudclient.FilterSince{}, hudclient.FilterTail(-1),
+		hudclient.FilterJSON(false))
+	ls := hudclient.NewLogStreamer(hudclient.FollowFlag(false), model.WebURL(*u), filter,
+		hudclient.NewIncrementalPrinter(hudclient.Stdout(out)), hudclient.SessionToken(testToken))
+
+	ctx, cancel := context.WithTimeout(logger.WithLogger(context.Background(), logger.NewTestLogger(&bytes.Buffer{})), 10*time.Second)
+	defer cancel()
+	require.NoError(t, ls.Stream(ctx))
+
+	// With the wrong session token, the CLI can't get the csrf token.
+	bad := hudclient.NewLogStreamer(hudclient.FollowFlag(false), model.WebURL(*u), filter,
+		hudclient.NewIncrementalPrinter(hudclient.Stdout(out)), hudclient.SessionToken("wrong-token"))
+	err = bad.Stream(ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid session token")
 }

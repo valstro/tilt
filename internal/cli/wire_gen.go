@@ -1059,7 +1059,8 @@ func wireLogStreamer(ctx context.Context, tiltAnalytics *analytics.TiltAnalytics
 	logFilter := client.NewLogFilter(filterSource, filterResources, filterLevel, filterSince, filterTail, filterJSON)
 	stdout := client.ProvideStdout()
 	logPrinter := client.ProvideLogPrinter(logFilter, stdout)
-	logStreamer := client.NewLogStreamer(follow, webURL, logFilter, logPrinter)
+	sessionToken := provideLogSessionToken()
+	logStreamer := client.NewLogStreamer(follow, webURL, logFilter, logPrinter, sessionToken)
 	return logStreamer, nil
 }
 
@@ -1155,7 +1156,7 @@ var BaseWireSet = wire.NewSet(
 	provideLogLevel,
 	provideLogSince,
 	provideLogTail,
-	provideLogJSON, hud.WireSet, prompt.WireSet, wire.Value(openurl.OpenURL(openurl.BrowserOpen)), provideLogActions, store.NewStore, wire.Bind(new(store.RStore), new(*store.Store)), wire.Bind(new(store.Dispatcher), new(*store.Store)), dockerprune.NewDockerPruner, provideTiltInfo, engine.NewUpper, analytics2.NewAnalyticsUpdater, analytics2.ProvideAnalyticsReporter, provideUpdateModeFlag, fsevent.ProvideWatcherMaker, fsevent.ProvideTimerMaker, controllers.WireSet, provideCITimeoutFlag,
+	provideLogJSON, provideLogSessionToken, hud.WireSet, prompt.WireSet, wire.Value(openurl.OpenURL(openurl.BrowserOpen)), provideLogActions, store.NewStore, wire.Bind(new(store.RStore), new(*store.Store)), wire.Bind(new(store.Dispatcher), new(*store.Store)), dockerprune.NewDockerPruner, provideTiltInfo, engine.NewUpper, analytics2.NewAnalyticsUpdater, analytics2.ProvideAnalyticsReporter, provideUpdateModeFlag, fsevent.ProvideWatcherMaker, fsevent.ProvideTimerMaker, controllers.WireSet, provideCITimeoutFlag,
 	provideWebVersion,
 	provideWebMode,
 	provideWebURL,
@@ -1265,4 +1266,10 @@ func provideLogTail() (client.FilterTail, error) {
 
 func provideLogJSON() client.FilterJSON {
 	return client.FilterJSON(logJSONFlag)
+}
+
+// provideLogSessionToken supplies the HUD session token that `tilt logs` uses
+// to fetch the websocket CSRF token, the same token apiGet/apiPostJson send.
+func provideLogSessionToken() client.SessionToken {
+	return client.SessionToken(loadToken())
 }

@@ -3,7 +3,11 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net/http"
+	neturl "net/url"
+	"strings"
 
 	"github.com/gorilla/websocket"
 	"github.com/pkg/errors"
@@ -17,29 +21,60 @@ import (
 
 type FollowFlag bool
 
+// SessionToken is the HUD session token (the X-Tilt-Token header value) that
+// authorizes requests to requireToken-gated HUD server routes.
+type SessionToken string
+
+// Header and route names mirror internal/hud/server. They are duplicated here
+// rather than imported so the client does not depend on the server package.
+const (
+	tiltTokenHeaderName   = "X-Tilt-Token"
+	websocketTokenPath    = "/api/websocket_token"
+	websocketViewPath     = "/ws/view"
+	websocketCSRFQueryKey = "csrf"
+)
+
 type LogStreamer struct {
-	follow  FollowFlag
-	url     model.WebURL
-	filter  LogFilter
-	printer LogPrinter
+	follow     FollowFlag
+	url        model.WebURL
+	filter     LogFilter
+	printer    LogPrinter
+	token      SessionToken
+	httpClient *http.Client
+	dialer     *websocket.Dialer
 }
 
-func NewLogStreamer(follow FollowFlag, url model.WebURL, filter LogFilter, printer LogPrinter) *LogStreamer {
+func NewLogStreamer(follow FollowFlag, url model.WebURL, filter LogFilter, printer LogPrinter, token SessionToken) *LogStreamer {
 	return &LogStreamer{
-		follow:  follow,
-		url:     url,
-		filter:  filter,
-		printer: printer,
+		follow:     follow,
+		url:        url,
+		filter:     filter,
+		printer:    printer,
+		token:      token,
+		httpClient: http.DefaultClient,
+		dialer:     websocket.DefaultDialer,
 	}
 }
 
 func (ls *LogStreamer) Stream(ctx context.Context) error {
-	url := ls.url
+	csrf, err := ls.fetchWebsocketToken(ctx)
+	if err != nil {
+		return err
+	}
+
+	url := neturl.URL(ls.url)
 	url.Scheme = "ws"
-	url.Path = "/ws/view"
+	url.Path = websocketViewPath
 	logger.Get(ctx).Debugf("connecting to %s", url.String())
 
-	conn, _, err := websocket.DefaultDialer.Dial(url.String(), nil)
+	// The server only upgrades /ws/view when ?csrf= carries the token served
+	// by /api/websocket_token. Keep it out of the logged/error URL.
+	dialURL := url
+	q := dialURL.Query()
+	q.Set(websocketCSRFQueryKey, csrf)
+	dialURL.RawQuery = q.Encode()
+
+	conn, _, err := ls.dialer.DialContext(ctx, dialURL.String(), nil)
 	if err != nil {
 		return errors.Wrapf(err, "dialing websocket %s", url.String())
 	}
@@ -47,6 +82,42 @@ func (ls *LogStreamer) Stream(ctx context.Context) error {
 
 	wsr := newWebsocketReaderForLogs(conn, bool(ls.follow), ls.filter, ls.printer)
 	return wsr.Listen(ctx)
+}
+
+// fetchWebsocketToken asks the HUD server for the websocket CSRF token,
+// authenticating with the session token.
+func (ls *LogStreamer) fetchWebsocketToken(ctx context.Context) (string, error) {
+	url := neturl.URL(ls.url)
+	url.Scheme = "http"
+	url.Path = websocketTokenPath
+	url.RawQuery = ""
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url.String(), nil)
+	if err != nil {
+		return "", errors.Wrapf(err, "building request for %s", url.String())
+	}
+	req.Header.Set(tiltTokenHeaderName, string(ls.token))
+
+	res, err := ls.httpClient.Do(req)
+	if err != nil {
+		return "", errors.Wrapf(err, "fetching websocket token from %s", url.String())
+	}
+	defer res.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(res.Body, 4096))
+	if err != nil {
+		return "", errors.Wrapf(err, "reading websocket token from %s", url.String())
+	}
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("fetching websocket token from %s: %s: %s",
+			url.String(), res.Status, strings.TrimSpace(string(body)))
+	}
+
+	csrf := strings.TrimSpace(string(body))
+	if csrf == "" {
+		return "", fmt.Errorf("fetching websocket token from %s: empty response", url.String())
+	}
+	return csrf, nil
 }
 
 type WebsocketConn interface {

@@ -118,6 +118,7 @@ var BaseWireSet = wire.NewSet(
 	provideLogSince,
 	provideLogTail,
 	provideLogJSON,
+	provideLogSessionToken,
 	hud.WireSet,
 	prompt.WireSet,
 	wire.Value(openurl.OpenURL(openurl.BrowserOpen)),
@@ -390,4 +391,10 @@ func provideLogTail() (hudclient.FilterTail, error) {
 
 func provideLogJSON() hudclient.FilterJSON {
 	return hudclient.FilterJSON(logJSONFlag)
+}
+
+// provideLogSessionToken supplies the HUD session token that `tilt logs` uses
+// to fetch the websocket CSRF token, the same token apiGet/apiPostJson send.
+func provideLogSessionToken() hudclient.SessionToken {
+	return hudclient.SessionToken(loadToken())
 }
